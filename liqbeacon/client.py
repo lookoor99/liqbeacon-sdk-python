@@ -6,6 +6,7 @@ Mirrors ``LiqbeaconClient`` in the Node SDK.
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import urllib.error
@@ -13,13 +14,19 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from . import __version__
+
+# urllib's default "Python-urllib/3.x" is blocked outright by many CDNs and WAFs.
+_USER_AGENT = f"liqbeacon-python/{__version__}"
+
 
 class ApiError(Exception):
-    """Raised when the API answers with a non-2xx status.
+    """Raised when an API call does not produce a usable answer.
 
-    ``status`` is the HTTP status code (0 when the request never got an
-    answer), and ``body`` the raw response text, which usually carries the
-    API's ``{"error": ..., "message": ...}``.
+    That is a non-2xx status, a network failure or timeout, or a 2xx response
+    whose body is not JSON. ``status`` is the HTTP status code (0 when the
+    request never got an answer), and ``body`` the raw response text, which
+    usually carries the API's ``{"error": ..., "message": ...}``.
     """
 
     def __init__(self, status: int, reason: str, body: str) -> None:
@@ -40,36 +47,65 @@ class LiqbeaconClient:
             raise TypeError("LiqbeaconClient: base_url is required")
         if not api_key:
             raise TypeError("LiqbeaconClient: api_key is required")
+        # urlopen also follows file:// and ftp:// URLs; never send the key there.
+        if urllib.parse.urlsplit(base_url).scheme.lower() not in ("http", "https"):
+            raise ValueError(f"LiqbeaconClient: base_url must be an http(s) URL, got {base_url!r}")
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
 
     def _request(self, path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None) -> Any:
         data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": _USER_AGENT,
+            "X-Api-Key": self._api_key,
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             f"{self._base_url}{path}",
             data=data,
             method=method,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-Api-Key": self._api_key,
-            },
+            headers=headers,
         )
 
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                status = response.status
+                raw = response.read()
         except urllib.error.HTTPError as error:
-            text = error.read().decode("utf-8", errors="replace")
+            try:
+                text = error.read().decode("utf-8", errors="replace")
+            except (OSError, http.client.HTTPException):
+                text = ""
             raise ApiError(error.code, str(error.reason), text) from error
         except urllib.error.URLError as error:
-            raise ApiError(0, "request failed", str(error.reason)) from error
-        except OSError as error:
+            reason = "timeout" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "request failed"
+            raise ApiError(0, reason, str(error.reason)) from error
+        except (OSError, http.client.HTTPException) as error:
             # A timeout or reset while reading the response is not wrapped in
-            # URLError; keep the "status 0 means unreachable" contract anyway.
+            # URLError, nor is a truncated body (IncompleteRead); keep the
+            # "status 0 means unreachable" contract anyway.
             reason = "timeout" if isinstance(error, (TimeoutError, socket.timeout)) else "request failed"
             raise ApiError(0, reason, str(error)) from error
+
+        if not raw.strip():
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except ValueError as error:
+            # Typically an HTML page from a proxy or captive portal.
+            raise ApiError(status, "invalid JSON response", raw.decode("utf-8", errors="replace")) from error
+
+    @staticmethod
+    def _next_cursor(page: Dict[str, Any], previous: Optional[str]) -> Optional[str]:
+        cursor = page.get("next_cursor")
+        if cursor and cursor == previous:
+            # Following it would request the same page forever.
+            # The API did answer (2xx), so this is not a status-0 failure.
+            raise ApiError(200, "pagination did not advance", json.dumps(page)[:500])
+        return cursor
 
     @staticmethod
     def _subscription_path(subscription_id: str, suffix: str) -> str:
@@ -92,7 +128,7 @@ class LiqbeaconClient:
         params: Dict[str, str] = {}
         if cursor:
             params["after"] = cursor
-        if limit:
+        if limit is not None:
             params["limit"] = str(limit)
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         return self._request(self._subscription_path(subscription_id, "utxos") + query)
@@ -112,7 +148,7 @@ class LiqbeaconClient:
             if next_seq is None:
                 next_seq = page["next_seq"]
             utxos.extend(page["utxos"])
-            cursor = page.get("next_cursor")
+            cursor = self._next_cursor(page, cursor)
             if not cursor:
                 break
         return utxos, next_seq if next_seq is not None else 1
@@ -123,7 +159,7 @@ class LiqbeaconClient:
         while True:
             page = self.snapshot(subscription_id, cursor=cursor)
             yield from page["utxos"]
-            cursor = page.get("next_cursor")
+            cursor = self._next_cursor(page, cursor)
             if not cursor:
                 break
 
@@ -134,7 +170,7 @@ class LiqbeaconClient:
         Returns ``{"requeued": int, "from_seq": int, "message": str}``.
         """
         body: Dict[str, Any] = {"from_seq": from_seq}
-        if limit:
+        if limit is not None:
             body["limit"] = limit
         return self._request(self._subscription_path(subscription_id, "replay"), method="POST", body=body)
 
