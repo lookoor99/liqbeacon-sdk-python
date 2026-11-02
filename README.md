@@ -96,12 +96,17 @@ duplicate, missing = tracker.check(event)
 if duplicate:
     return "", 200          # at-least-once; already handled
 if missing:
-    log.warning("missed %s", missing)
-    client.replay(event.subscription_id, missing[0])
+    first, last = missing   # inclusive range of seqs not yet processed
+    log.warning("missed seq %d..%d", first, last)
+    client.replay(event.subscription_id, first)
 
 handle(event)               # if this raises, nothing is recorded
 tracker.commit(event)       # only after the handler succeeded
 ```
+
+`missing` is `None` when there is no gap, otherwise `(first, last)`. When
+several gaps are open at once, some seqs inside that range may already be
+processed; replaying from `first` covers every gap.
 
 `check` never records anything; `commit` does, and only once you call it. That
 is what keeps a retried event from being mistaken for a duplicate, and lets
@@ -142,12 +147,14 @@ key (`sk_live_...`) and uses only the standard library.
 | `replay(sub, from_seq, limit=None)` | `POST /v1/subscriptions/{id}/replay` | `requeued`, `from_seq`, `message` |
 | `cursor(sub)` | `GET /v1/subscriptions/{id}/events/cursor` | The retained sequence range and `next_seq` |
 
-A non-2xx answer, a network failure or a timeout raises `ApiError`, with
-`status` (0 when the API could not be reached) and the raw response `body`.
+A non-2xx answer, a 2xx answer that is not JSON, a network failure or a timeout
+raises `ApiError`, with `status` (0 when the API could not be reached) and the
+raw response `body`.
 
 `verify_event` raises `SignatureError` for a request that cannot be trusted, and
 `TypeError` for a configuration mistake: a parsed body (`request.json`) instead
-of the raw bytes, or no secret.
+of the raw bytes, or no secret. A correctly signed body that is not a valid
+event raises `ValueError`.
 
 ## FastAPI
 
