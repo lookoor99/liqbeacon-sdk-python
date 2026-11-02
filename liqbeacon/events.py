@@ -10,6 +10,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
+SIGNATURE_HEADER = "X-Cardano-Signature"
+EVENT_ID_HEADER = "X-Cardano-Event-Id"
+EVENT_SEQ_HEADER = "X-Cardano-Event-Seq"
+SUBSCRIPTION_HEADER = "X-Cardano-Subscription"
+
 
 class SignatureError(Exception):
     """Raised when a webhook cannot be trusted.
@@ -87,8 +92,10 @@ def parse_signature_header(header: str) -> Tuple[int, List[str]]:
         if key == "t":
             # ASCII digits only: the same header must parse the same way in
             # every SDK (int() alone would also take "+17", "1_700" or
-            # full-width digits).
-            timestamp = int(value) if re.fullmatch(r"[0-9]+", value) else 0
+            # full-width digits). Capped in length because int() raises
+            # ValueError above 4300 digits on Python 3.11+, which would escape
+            # the SignatureError contract.
+            timestamp = int(value) if re.fullmatch(r"[0-9]{1,15}", value) else 0
         elif key == "v1" and value:
             signatures.append(value)
 
@@ -115,6 +122,8 @@ def verify_event(
             outside the tolerance window, or no digest matches.
         TypeError: if ``payload`` is not raw bytes or text, or no secret is
             given -- configuration errors, not forged requests.
+        ValueError: if the signature is valid but the body is not a valid
+            event (not UTF-8 JSON, or missing required fields).
     """
     if isinstance(payload, str):
         raw = payload.encode("utf-8")
@@ -130,17 +139,23 @@ def verify_event(
             "in FastAPI use await request.body()."
         )
 
+    if isinstance(secret, (bytes, bytearray)):
+        # list(b"...") would silently become a list of ints and then be
+        # reported as "no secret configured".
+        raise TypeError("verify_event: secret must be str or a list of str, not bytes")
     secrets = [secret] if isinstance(secret, str) else list(secret or [])
     secrets = [s for s in secrets if isinstance(s, str) and s]
     if not secrets:
         raise TypeError("verify_event: no webhook secret configured (is WEBHOOK_SECRET set?)")
 
     if not header:
-        raise SignatureError("missing X-Cardano-Signature header")
+        raise SignatureError(f"missing {SIGNATURE_HEADER} header")
+    if not isinstance(header, str):
+        raise SignatureError(f"malformed {SIGNATURE_HEADER} header")
 
     timestamp, signatures = parse_signature_header(header)
     if not timestamp or not signatures:
-        raise SignatureError("malformed X-Cardano-Signature header")
+        raise SignatureError(f"malformed {SIGNATURE_HEADER} header")
 
     # The timestamp is inside the signed string, so it cannot be moved forward
     # without invalidating the digest. This bounds how long a captured request
@@ -167,7 +182,12 @@ def verify_event(
     if not matched:
         raise SignatureError("signature mismatch")
 
-    return CardanoEvent.from_dict(json.loads(raw.decode("utf-8")))
+    try:
+        return CardanoEvent.from_dict(json.loads(raw.decode("utf-8")))
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        # UnicodeDecodeError and JSONDecodeError are ValueErrors; KeyError and
+        # TypeError/AttributeError come from a body that is not an event object.
+        raise ValueError(f"verify_event: signed payload is not a valid event: {error!r}") from error
 
 
 class SequenceTracker:
@@ -179,7 +199,8 @@ class SequenceTracker:
         if duplicate:
             return "", 200          # already processed
         if missing:
-            request_replay(missing[0])
+            first, last = missing   # inclusive range
+            request_replay(first)
         handle(event)               # may raise: nothing is recorded
         tracker.commit(event)       # only after it really succeeded
 
@@ -198,27 +219,38 @@ class SequenceTracker:
         #: Committed seqs above the contiguous mark, beyond a gap.
         self._above: Dict[str, Set[int]] = {}
 
-    def check(self, event: CardanoEvent) -> Tuple[bool, List[int]]:
+    def check(self, event: CardanoEvent) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """Classify an event without recording it.
 
         Returns:
             ``(duplicate, missing)`` -- whether this event was already
-            processed, and the sequence numbers before it not yet committed.
+            processed, and ``(first, last)``: the lowest and highest sequence
+            numbers before it not yet committed, or ``None`` when there is no
+            gap. Seqs inside that range may already be committed when several
+            gaps are open; replaying from ``first`` covers all of them.
+
+        The range is returned instead of every number so that a large jump in
+        ``seq`` costs nothing to report.
         """
         if event.seq is None:
-            return False, []
+            return False, None
 
         mark = self._contiguous.get(event.subscription_id)
         # Nothing known yet: this event sets the baseline.
         if mark is None:
-            return False, []
+            return False, None
 
         above = self._above.get(event.subscription_id, set())
         if event.seq <= mark or event.seq in above:
-            return True, []
+            return True, None
 
-        missing = [seq for seq in range(mark + 1, event.seq) if seq not in above]
-        return False, missing
+        # Bounded by len(above), not by the size of the jump.
+        first, last = mark + 1, event.seq - 1
+        while first <= last and first in above:
+            first += 1
+        while last >= first and last in above:
+            last -= 1
+        return False, (first, last) if first <= last else None
 
     def commit(self, event: CardanoEvent) -> None:
         """Record an event as processed. Call only once your handler succeeded."""
@@ -242,7 +274,7 @@ class SequenceTracker:
         if not above:
             del self._above[sub]
 
-    def track(self, event: CardanoEvent) -> Tuple[bool, List[int]]:
+    def track(self, event: CardanoEvent) -> Tuple[bool, Optional[Tuple[int, int]]]:
         """``check`` and ``commit`` in one call.
 
         Only safe when handling cannot fail after this point; otherwise use
