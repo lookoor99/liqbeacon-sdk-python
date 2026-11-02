@@ -9,8 +9,15 @@ comparing digests with ``==`` (which leaks timing). Everything here takes raw
 bytes and uses :func:`hmac.compare_digest`.
 """
 
+# Defined before the submodule imports: client.py reads it for User-Agent.
+__version__ = "1.0.0"
+
 from .client import ApiError, LiqbeaconClient
 from .events import (
+    EVENT_ID_HEADER,
+    EVENT_SEQ_HEADER,
+    SIGNATURE_HEADER,
+    SUBSCRIPTION_HEADER,
     CardanoEvent,
     SequenceTracker,
     SignatureError,
@@ -31,10 +38,3 @@ __all__ = [
     "EVENT_SEQ_HEADER",
     "SUBSCRIPTION_HEADER",
 ]
-
-__version__ = "1.0.0"
-
-SIGNATURE_HEADER = "X-Cardano-Signature"
-EVENT_ID_HEADER = "X-Cardano-Event-Id"
-EVENT_SEQ_HEADER = "X-Cardano-Event-Seq"
-SUBSCRIPTION_HEADER = "X-Cardano-Subscription"
