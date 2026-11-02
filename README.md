@@ -196,3 +196,10 @@ async def webhook(request: Request):
 
 Return 2xx quickly. Your response time is inside the delivery timeout, so slow
 work belongs on a queue.
+
+## Build pack
+
+```bash
+python3 -m pip install build
+python3 -m build --wheel
+```
